@@ -1,0 +1,922 @@
+diff --git a/klipper/CMakeLists.txt b/klipper/CMakeLists.txt
+index 508004f..fc9e490 100644
+--- a/klipper/CMakeLists.txt
++++ b/klipper/CMakeLists.txt
+@@ -16,6 +16,8 @@ set(libklipper_common_SRCS
+     updateclipboardjob.cpp
+     utils.cpp
+     systemclipboard.cpp
++    synthetickeyboard.cpp synthetickeyboard.h
++    keymapper.cpp keymapper.h
+ )
+ 
+ ecm_qt_declare_logging_category(libklipper_common_SRCS HEADER klipper_debug.h IDENTIFIER KLIPPER_LOG CATEGORY_NAME org.kde.klipper DESCRIPTION "klipper" EXPORT KLIPPER)
+@@ -31,6 +33,7 @@ qt_generate_wayland_protocol_client_sources(klipper
+     PRIVATE_CODE
+     FILES
+         "${PLASMA_WAYLAND_PROTOCOLS_DIR}/plasma-shell.xml"
++        "${PLASMA_WAYLAND_PROTOCOLS_DIR}/fake-input.xml"
+ )
+ 
+ target_link_libraries(klipper
+@@ -38,6 +41,7 @@ target_link_libraries(klipper
+     Qt::DBus
+     Qt::Sql
+     Qt::Widgets
++    Qt::WaylandClient
+     KF6::ConfigGui
+     KF6::CoreAddons
+     KF6::GuiAddons
+@@ -60,6 +64,12 @@ target_link_libraries(klipper
+ 
+ if (HAVE_X11)
+     target_link_libraries(klipper XCB::XCB XCB::AUX)
++    find_package(XCB COMPONENTS XTEST)
++    if (XCB_XTEST_FOUND)
++        find_package(X11 REQUIRED)
++        target_link_libraries(klipper XCB::XTEST X11::X11)
++        target_compile_definitions(klipper PRIVATE HAVE_X11_XTEST)
++    endif()
+ endif()
+ 
+ set_target_properties(klipper PROPERTIES
+diff --git a/klipper/autotests/CMakeLists.txt b/klipper/autotests/CMakeLists.txt
+index f0a1901..5f867d6 100644
+--- a/klipper/autotests/CMakeLists.txt
++++ b/klipper/autotests/CMakeLists.txt
+@@ -22,6 +22,10 @@ target_link_libraries(testKlipperUtils
+ add_test(NAME klipper-testUtils COMMAND testKlipperUtils)
+ ecm_mark_as_test(testKlipperUtils)
+ # Klipper test
++# Test KeyMapper
++ecm_add_test(test_keymapper.cpp TEST_NAME klipper-testKeyMapper
++    LINK_LIBRARIES Qt::Test klipper)
++
+ ecm_add_test(klippertest.cpp TEST_NAME klippertest
+     LINK_LIBRARIES Qt::Test KF6::KIOCore klipper)
+ 
+diff --git a/klipper/autotests/test_keymapper.cpp b/klipper/autotests/test_keymapper.cpp
+new file mode 100644
+index 0000000..a1674a6
+--- /dev/null
++++ b/klipper/autotests/test_keymapper.cpp
+@@ -0,0 +1,136 @@
++/*
++    SPDX-FileCopyrightText: 2026 Nuri <nuri@example.com>
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "../keymapper.h"
++
++#include <QKeySequence>
++#include <QObject>
++#include <QTest>
++#include <linux/input-event-codes.h>
++
++class KeyMapperTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void testBasicKeys();
++    void testModifiers();
++    void testX11Keys();
++    void testX11Modifiers();
++    void testDecomposeKeySequence();
++    void testInvalidOrEmptySequence();
++    void testKeySequenceFromString();
++};
++
++void KeyMapperTest::testBasicKeys()
++{
++    QCOMPARE(KeyMapper::toLinuxKey(Qt::Key_V), static_cast<quint32>(KEY_V));
++    QCOMPARE(KeyMapper::toLinuxKey(Qt::Key_C), static_cast<quint32>(KEY_C));
++    QCOMPARE(KeyMapper::toLinuxKey(Qt::Key_X), static_cast<quint32>(KEY_X));
++    QCOMPARE(KeyMapper::toLinuxKey(Qt::Key_Insert), static_cast<quint32>(KEY_INSERT));
++    QCOMPARE(KeyMapper::toLinuxKey(Qt::Key_Enter), static_cast<quint32>(KEY_ENTER));
++    QCOMPARE(KeyMapper::toLinuxKey(Qt::Key_Return), static_cast<quint32>(KEY_ENTER));
++}
++
++void KeyMapperTest::testModifiers()
++{
++    const auto ctrl = KeyMapper::modifiersToLinuxKeys(Qt::ControlModifier);
++    QCOMPARE(ctrl.size(), 1);
++    QCOMPARE(ctrl.first(), static_cast<quint32>(KEY_LEFTCTRL));
++
++    const auto ctrlShift = KeyMapper::modifiersToLinuxKeys(Qt::ControlModifier | Qt::ShiftModifier);
++    QCOMPARE(ctrlShift.size(), 2);
++    QVERIFY(ctrlShift.contains(static_cast<quint32>(KEY_LEFTCTRL)));
++    QVERIFY(ctrlShift.contains(static_cast<quint32>(KEY_LEFTSHIFT)));
++}
++
++void KeyMapperTest::testX11Keys()
++{
++    QCOMPARE(KeyMapper::toX11KeySym(Qt::Key_V), static_cast<quint32>(0x0076)); // 'v'
++    QCOMPARE(KeyMapper::toX11KeySym(Qt::Key_C), static_cast<quint32>(0x0063)); // 'c'
++    QCOMPARE(KeyMapper::toX11KeySym(Qt::Key_Insert), static_cast<quint32>(0xff63)); // XK_Insert
++    QCOMPARE(KeyMapper::toX11KeySym(Qt::Key_Return), static_cast<quint32>(0xff0d)); // XK_Return
++    QCOMPARE(KeyMapper::toX11KeySym(Qt::Key_Enter), static_cast<quint32>(0xff0d));
++}
++
++void KeyMapperTest::testX11Modifiers()
++{
++    const auto ctrl = KeyMapper::modifiersToX11KeySyms(Qt::ControlModifier);
++    QCOMPARE(ctrl.size(), 1);
++    QCOMPARE(ctrl.first(), static_cast<quint32>(0xffe3)); // XK_Control_L
++
++    const auto ctrlShift = KeyMapper::modifiersToX11KeySyms(Qt::ControlModifier | Qt::ShiftModifier);
++    QCOMPARE(ctrlShift.size(), 2);
++    QVERIFY(ctrlShift.contains(static_cast<quint32>(0xffe3)));
++    QVERIFY(ctrlShift.contains(static_cast<quint32>(0xffe1))); // XK_Shift_L
++}
++
++void KeyMapperTest::testDecomposeKeySequence()
++{
++    QList<quint32> modifiers;
++    quint32 key = 0;
++
++    // Ctrl+V
++    QVERIFY(KeyMapper::decomposeKeySequence(QKeySequence(Qt::CTRL | Qt::Key_V), modifiers, key));
++    QCOMPARE(key, static_cast<quint32>(KEY_V));
++    QCOMPARE(modifiers.size(), 1);
++    QCOMPARE(modifiers.first(), static_cast<quint32>(KEY_LEFTCTRL));
++
++    // Ctrl+Shift+V
++    modifiers.clear();
++    key = 0;
++    QVERIFY(KeyMapper::decomposeKeySequence(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_V), modifiers, key));
++    QCOMPARE(key, static_cast<quint32>(KEY_V));
++    QCOMPARE(modifiers.size(), 2);
++    QVERIFY(modifiers.contains(static_cast<quint32>(KEY_LEFTCTRL)));
++    QVERIFY(modifiers.contains(static_cast<quint32>(KEY_LEFTSHIFT)));
++
++    // Shift+Insert
++    modifiers.clear();
++    key = 0;
++    QVERIFY(KeyMapper::decomposeKeySequence(QKeySequence(Qt::SHIFT | Qt::Key_Insert), modifiers, key));
++    QCOMPARE(key, static_cast<quint32>(KEY_INSERT));
++    QCOMPARE(modifiers.size(), 1);
++    QCOMPARE(modifiers.first(), static_cast<quint32>(KEY_LEFTSHIFT));
++}
++
++void KeyMapperTest::testInvalidOrEmptySequence()
++{
++    QList<quint32> modifiers;
++    quint32 key = 0;
++
++    QVERIFY(!KeyMapper::decomposeKeySequence(QKeySequence(), modifiers, key));
++    QVERIFY(!KeyMapper::decomposeKeySequence(QKeySequence(Qt::Key_unknown), modifiers, key));
++}
++
++void KeyMapperTest::testKeySequenceFromString()
++{
++    // NativeText from KKeySequenceWidget / KDE config
++    const QKeySequence seqCtrlVNative = KeyMapper::keySequenceFromString(QStringLiteral("Control+V"));
++    QVERIFY(!seqCtrlVNative.isEmpty());
++    QCOMPARE(seqCtrlVNative.toString(QKeySequence::PortableText), QStringLiteral("Ctrl+V"));
++
++    // PortableText from default kcfg
++    const QKeySequence seqCtrlVPort = KeyMapper::keySequenceFromString(QStringLiteral("Ctrl+V"));
++    QVERIFY(!seqCtrlVPort.isEmpty());
++    QCOMPARE(seqCtrlVPort.toString(QKeySequence::PortableText), QStringLiteral("Ctrl+V"));
++
++    // Multi-modifier
++    const QKeySequence seqCtrlShiftV = KeyMapper::keySequenceFromString(QStringLiteral("Ctrl+Shift+V"));
++    QVERIFY(!seqCtrlShiftV.isEmpty());
++    QCOMPARE(seqCtrlShiftV.toString(QKeySequence::PortableText), QStringLiteral("Ctrl+Shift+V"));
++
++    // Shift+Insert
++    const QKeySequence seqShiftIns = KeyMapper::keySequenceFromString(QStringLiteral("Shift+Insert"));
++    QVERIFY(!seqShiftIns.isEmpty());
++
++    // Empty and invalid
++    QVERIFY(KeyMapper::keySequenceFromString(QString()).isEmpty());
++    QVERIFY(KeyMapper::keySequenceFromString(QStringLiteral("   ")).isEmpty());
++    QVERIFY(KeyMapper::keySequenceFromString(QStringLiteral("invalidKey")).isEmpty());
++}
++
++QTEST_MAIN(KeyMapperTest)
++#include "test_keymapper.moc"
+diff --git a/klipper/configdialog.cpp b/klipper/configdialog.cpp
+index 5307e39..195a830 100644
+--- a/klipper/configdialog.cpp
++++ b/klipper/configdialog.cpp
+@@ -21,6 +21,7 @@
+ 
+ #include <KActionCollection>
+ #include <KConfigSkeleton>
++#include <KKeySequenceWidget>
+ #include <KLocalization>
+ #include <KShortcutsEditor>
+ #include <kconfigskeleton.h>
+@@ -82,6 +83,23 @@ GeneralWidget::GeneralWidget(QWidget *parent)
+     m_enableHistoryCb->setObjectName(QLatin1String("kcfg_KeepClipboardContents"));
+     layout->addRow(i18n("Clipboard history:"), m_enableHistoryCb);
+ 
++    // Paste on Select
++    item = KlipperSettings::self()->pasteOnSelectItem();
++    m_pasteOnSelectCb = new QCheckBox(item->label(), this);
++    m_pasteOnSelectCb->setObjectName(QLatin1String("kcfg_PasteOnSelect"));
++    m_pasteOnSelectCb->setToolTip(item->toolTip());
++    layout->addRow(i18n("Automatic pasting:"), m_pasteOnSelectCb);
++
++    // Paste Key Sequence
++    item = KlipperSettings::self()->pasteKeySequenceItem();
++    m_pasteKeySequenceWidget = new KKeySequenceWidget(this);
++    m_pasteKeySequenceWidget->setObjectName(QLatin1String("kcfg_PasteKeySequence"));
++    m_pasteKeySequenceWidget->setToolTip(item->toolTip());
++    m_pasteKeySequenceWidget->setCheckForConflictsAgainst(KKeySequenceWidget::None);
++    m_pasteKeySequenceWidget->setEnabled(KlipperSettings::pasteOnSelect());
++    connect(m_pasteOnSelectCb, &QCheckBox::toggled, m_pasteKeySequenceWidget, &QWidget::setEnabled);
++    layout->addRow(item->label(), m_pasteKeySequenceWidget);
++
+     // Clipboard history size
+     item = KlipperSettings::self()->maxClipItemsItem();
+     m_historySizeSb = new QSpinBox(this);
+diff --git a/klipper/configdialog.h b/klipper/configdialog.h
+index ddda41d..b0dc160 100644
+--- a/klipper/configdialog.h
++++ b/klipper/configdialog.h
+@@ -20,6 +20,7 @@ class QSpinBox;
+ class QTreeWidgetItem;
+ class QLabel;
+ class ActionsTreeWidget;
++class KKeySequenceWidget;
+ 
+ class GeneralWidget : public QWidget
+ {
+@@ -31,6 +32,8 @@ public:
+ 
+ private:
+     QCheckBox *m_enableHistoryCb;
++    QCheckBox *m_pasteOnSelectCb;
++    KKeySequenceWidget *m_pasteKeySequenceWidget;
+     QCheckBox *m_syncClipboardsCb;
+ 
+     QCheckBox *m_saveSelectionCb;
+diff --git a/klipper/declarative/declarativehistorymodel.cpp b/klipper/declarative/declarativehistorymodel.cpp
+index c964e1d..2beb42f 100644
+--- a/klipper/declarative/declarativehistorymodel.cpp
++++ b/klipper/declarative/declarativehistorymodel.cpp
+@@ -7,6 +7,11 @@
+ #include "declarativehistorymodel.h"
+ #include "historyitem.h"
+ #include "historymodel.h"
++#include "keymapper.h"
++#include "klippersettings.h"
++#include "synthetickeyboard.h"
++#include <QKeySequence>
++#include <QTimer>
+ 
+ DeclarativeHistoryModel::DeclarativeHistoryModel(QObject *parent)
+     : QSortFilterProxyModel(parent)
+@@ -32,6 +37,18 @@ DeclarativeHistoryModel::DeclarativeHistoryModel(QObject *parent)
+     });
+ 
+     connect(m_model.get(), &HistoryModel::changed, this, &DeclarativeHistoryModel::currentTextChanged);
++
++    m_pasteOnSelect = KlipperSettings::pasteOnSelect();
++    connect(KlipperSettings::self(), &KCoreConfigSkeleton::configChanged, this, [this]() {
++        if (m_pasteOnSelect != KlipperSettings::pasteOnSelect()) {
++            m_pasteOnSelect = KlipperSettings::pasteOnSelect();
++            Q_EMIT pasteOnSelectChanged();
++        }
++    });
++
++    if (m_pasteOnSelect) {
++        SyntheticKeyboard::self();
++    }
+ }
+ 
+ DeclarativeHistoryModel::~DeclarativeHistoryModel() = default;
+@@ -71,6 +88,28 @@ void DeclarativeHistoryModel::moveToTop(const QString &uuid)
+     m_model->moveToTop(uuid);
+ }
+ 
++bool DeclarativeHistoryModel::pasteOnSelect() const
++{
++    return KlipperSettings::pasteOnSelect();
++}
++
++void DeclarativeHistoryModel::selectAndPaste(const QString &uuid)
++{
++    moveToTop(uuid);
++
++    if (KlipperSettings::pasteOnSelect()) {
++        const QString seqStr = KlipperSettings::pasteKeySequence();
++        const QKeySequence seq = KeyMapper::keySequenceFromString(seqStr);
++        if (seq.isEmpty()) {
++            return;
++        }
++        // Delay ensures popup is unmapped and target window regains active focus before keystroke injection
++        QTimer::singleShot(150, this, [seq]() {
++            SyntheticKeyboard::self()->sendKeySequence(seq);
++        });
++    }
++}
++
+ void DeclarativeHistoryModel::remove(const QString &uuid)
+ {
+     m_model->remove(uuid);
+diff --git a/klipper/declarative/declarativehistorymodel.h b/klipper/declarative/declarativehistorymodel.h
+index d820c23..76e2d44 100644
+--- a/klipper/declarative/declarativehistorymodel.h
++++ b/klipper/declarative/declarativehistorymodel.h
+@@ -26,6 +26,7 @@ class DeclarativeHistoryModel : public QSortFilterProxyModel
+     Q_PROPERTY(QString currentText READ currentText NOTIFY currentTextChanged)
+ 
+     Q_PROPERTY(bool starredOnly READ starredOnly WRITE setStarredOnly NOTIFY starredOnlyChanged)
++    Q_PROPERTY(bool pasteOnSelect READ pasteOnSelect NOTIFY pasteOnSelectChanged)
+ 
+ public:
+     explicit DeclarativeHistoryModel(QObject *parent = nullptr);
+@@ -37,8 +38,10 @@ public:
+ 
+     bool starredOnly() const;
+     void setStarredOnly(bool value);
++    bool pasteOnSelect() const;
+ 
+     Q_INVOKABLE void moveToTop(const QString &uuid);
++    Q_INVOKABLE void selectAndPaste(const QString &uuid);
+ 
+     Q_INVOKABLE void remove(const QString &uuid);
+     Q_INVOKABLE void clearHistory();
+@@ -51,6 +54,7 @@ Q_SIGNALS:
+     void starredCountChanged();
+     void currentTextChanged();
+     void starredOnlyChanged();
++    void pasteOnSelectChanged();
+ 
+ protected:
+     bool filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const override;
+@@ -58,5 +62,6 @@ protected:
+ private:
+     std::shared_ptr<HistoryModel> m_model;
+     bool m_starredOnly = false;
++    bool m_pasteOnSelect = false;
+     QPropertyNotifier m_starredCountNotifier;
+ };
+diff --git a/klipper/declarative/qml/ClipboardMenu.qml b/klipper/declarative/qml/ClipboardMenu.qml
+index cff00a1..c96bb4b 100644
+--- a/klipper/declarative/qml/ClipboardMenu.qml
++++ b/klipper/declarative/qml/ClipboardMenu.qml
+@@ -51,7 +51,13 @@ PlasmaComponents3.ScrollView {
+ 
+     PlasmaComponents3.ScrollBar.horizontal.policy: PlasmaComponents3.ScrollBar.AlwaysOff
+ 
+-    onItemSelected: uuid => model.moveToTop(uuid);
++    onItemSelected: uuid => {
++        if (model.pasteOnSelect) {
++            model.selectAndPaste(uuid);
++        } else {
++            model.moveToTop(uuid);
++        }
++    }
+     onRemove: uuid => {
+         model.remove(uuid);
+         // Prevents a race when after deleting an item, the hover would not reregister
+diff --git a/klipper/keymapper.cpp b/klipper/keymapper.cpp
+new file mode 100644
+index 0000000..3a5e357
+--- /dev/null
++++ b/klipper/keymapper.cpp
+@@ -0,0 +1,207 @@
++/*
++    SPDX-FileCopyrightText: 2026 Nuri <nuri@example.com>
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "keymapper.h"
++
++#include <QKeyCombination>
++#include <QKeySequence>
++#include <linux/input-event-codes.h>
++
++namespace KeyMapper
++{
++
++quint32 toLinuxKey(Qt::Key key)
++{
++    // Letters A-Z
++    if (key >= Qt::Key_A && key <= Qt::Key_Z) {
++        static constexpr quint32 letterCodes[] = {
++            KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H,
++            KEY_I, KEY_J, KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P,
++            KEY_Q, KEY_R, KEY_S, KEY_T, KEY_U, KEY_V, KEY_W, KEY_X,
++            KEY_Y, KEY_Z
++        };
++        return letterCodes[key - Qt::Key_A];
++    }
++
++    // Digits 0-9
++    if (key >= Qt::Key_0 && key <= Qt::Key_9) {
++        if (key == Qt::Key_0) {
++            return KEY_0;
++        }
++        return KEY_1 + (key - Qt::Key_1);
++    }
++
++    // Function keys F1-F12
++    if (key >= Qt::Key_F1 && key <= Qt::Key_F10) {
++        return KEY_F1 + (key - Qt::Key_F1);
++    }
++    if (key == Qt::Key_F11) {
++        return KEY_F11;
++    }
++    if (key == Qt::Key_F12) {
++        return KEY_F12;
++    }
++
++    // Common navigation and editing keys
++    switch (key) {
++    case Qt::Key_Return:
++    case Qt::Key_Enter:
++        return KEY_ENTER;
++    case Qt::Key_Insert:
++        return KEY_INSERT;
++    case Qt::Key_Delete:
++        return KEY_DELETE;
++    case Qt::Key_Home:
++        return KEY_HOME;
++    case Qt::Key_End:
++        return KEY_END;
++    case Qt::Key_PageUp:
++        return KEY_PAGEUP;
++    case Qt::Key_PageDown:
++        return KEY_PAGEDOWN;
++    case Qt::Key_Space:
++        return KEY_SPACE;
++    case Qt::Key_Tab:
++        return KEY_TAB;
++    case Qt::Key_Backspace:
++        return KEY_BACKSPACE;
++    case Qt::Key_Escape:
++        return KEY_ESC;
++    case Qt::Key_Left:
++        return KEY_LEFT;
++    case Qt::Key_Right:
++        return KEY_RIGHT;
++    case Qt::Key_Up:
++        return KEY_UP;
++    case Qt::Key_Down:
++        return KEY_DOWN;
++    default:
++        return 0;
++    }
++}
++
++QList<quint32> modifiersToLinuxKeys(Qt::KeyboardModifiers modifiers)
++{
++    QList<quint32> result;
++    if (modifiers & Qt::ControlModifier) {
++        result.append(KEY_LEFTCTRL);
++    }
++    if (modifiers & Qt::ShiftModifier) {
++        result.append(KEY_LEFTSHIFT);
++    }
++    if (modifiers & Qt::AltModifier) {
++        result.append(KEY_LEFTALT);
++    }
++    if (modifiers & Qt::MetaModifier) {
++        result.append(KEY_LEFTMETA);
++    }
++    return result;
++}
++
++quint32 toX11KeySym(Qt::Key key)
++{
++    if (key >= Qt::Key_A && key <= Qt::Key_Z) {
++        return 0x0061 + (key - Qt::Key_A); // 'a' .. 'z'
++    }
++    if (key >= Qt::Key_0 && key <= Qt::Key_9) {
++        return 0x0030 + (key - Qt::Key_0); // '0' .. '9'
++    }
++    if (key >= Qt::Key_F1 && key <= Qt::Key_F12) {
++        return 0xffbe + (key - Qt::Key_F1); // XK_F1 .. XK_F12
++    }
++
++    switch (key) {
++    case Qt::Key_Return:
++    case Qt::Key_Enter:
++        return 0xff0d; // XK_Return
++    case Qt::Key_Insert:
++        return 0xff63; // XK_Insert
++    case Qt::Key_Delete:
++        return 0xffff; // XK_Delete
++    case Qt::Key_Home:
++        return 0xff50; // XK_Home
++    case Qt::Key_End:
++        return 0xff57; // XK_End
++    case Qt::Key_PageUp:
++        return 0xff55; // XK_Page_Up
++    case Qt::Key_PageDown:
++        return 0xff56; // XK_Page_Down
++    case Qt::Key_Space:
++        return 0x0020; // XK_space
++    case Qt::Key_Tab:
++        return 0xff09; // XK_Tab
++    case Qt::Key_Backspace:
++        return 0xff08; // XK_BackSpace
++    case Qt::Key_Escape:
++        return 0xff1b; // XK_Escape
++    case Qt::Key_Left:
++        return 0xff51; // XK_Left
++    case Qt::Key_Right:
++        return 0xff53; // XK_Right
++    case Qt::Key_Up:
++        return 0xff52; // XK_Up
++    case Qt::Key_Down:
++        return 0xff54; // XK_Down
++    default:
++        return 0;
++    }
++}
++
++QList<quint32> modifiersToX11KeySyms(Qt::KeyboardModifiers modifiers)
++{
++    QList<quint32> result;
++    if (modifiers & Qt::ControlModifier) {
++        result.append(0xffe3); // XK_Control_L
++    }
++    if (modifiers & Qt::ShiftModifier) {
++        result.append(0xffe1); // XK_Shift_L
++    }
++    if (modifiers & Qt::AltModifier) {
++        result.append(0xffe9); // XK_Alt_L
++    }
++    if (modifiers & Qt::MetaModifier) {
++        result.append(0xffeb); // XK_Super_L
++    }
++    return result;
++}
++
++bool decomposeKeySequence(const QKeySequence &seq, QList<quint32> &modifiersOut, quint32 &keyOut)
++{
++    if (seq.isEmpty() || seq.count() == 0) {
++        return false;
++    }
++
++    const QKeyCombination comb = seq[0];
++    const Qt::Key key = comb.key();
++    if (key == Qt::Key_unknown || key == 0) {
++        return false;
++    }
++
++    const quint32 linuxKey = toLinuxKey(key);
++    if (linuxKey == 0) {
++        return false;
++    }
++
++    modifiersOut = modifiersToLinuxKeys(comb.keyboardModifiers());
++    keyOut = linuxKey;
++    return true;
++}
++
++QKeySequence keySequenceFromString(const QString &str)
++{
++    if (str.trimmed().isEmpty()) {
++        return {};
++    }
++    QKeySequence seq = QKeySequence::fromString(str, QKeySequence::NativeText);
++    if (seq.isEmpty() || seq[0].key() == Qt::Key_unknown || seq[0].key() == 0) {
++        seq = QKeySequence::fromString(str, QKeySequence::PortableText);
++    }
++    if (seq.isEmpty() || seq[0].key() == Qt::Key_unknown || seq[0].key() == 0) {
++        return {};
++    }
++    return seq;
++}
++
++} // namespace KeyMapper
+diff --git a/klipper/keymapper.h b/klipper/keymapper.h
+new file mode 100644
+index 0000000..0d79536
+--- /dev/null
++++ b/klipper/keymapper.h
+@@ -0,0 +1,35 @@
++/*
++    SPDX-FileCopyrightText: 2026 Nuri <nuri@example.com>
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#ifndef KEYMAPPER_H
++#define KEYMAPPER_H
++
++#if __has_include("klipper_export.h")
++#include "klipper_export.h"
++#endif
++
++#ifndef KLIPPER_EXPORT
++#define KLIPPER_EXPORT
++#endif
++
++#include <QtGlobal>
++#include <Qt>
++#include <QList>
++
++class QKeySequence;
++
++namespace KeyMapper
++{
++    KLIPPER_EXPORT quint32 toLinuxKey(Qt::Key key);
++    KLIPPER_EXPORT QList<quint32> modifiersToLinuxKeys(Qt::KeyboardModifiers modifiers);
++    KLIPPER_EXPORT bool decomposeKeySequence(const QKeySequence &seq, QList<quint32> &modifiersOut, quint32 &keyOut);
++
++    KLIPPER_EXPORT quint32 toX11KeySym(Qt::Key key);
++    KLIPPER_EXPORT QList<quint32> modifiersToX11KeySyms(Qt::KeyboardModifiers modifiers);
++
++    KLIPPER_EXPORT QKeySequence keySequenceFromString(const QString &str);
++}
++
++#endif // KEYMAPPER_H
+diff --git a/klipper/klipper.kcfg b/klipper/klipper.kcfg
+index 4f15ae7..5615980 100644
+--- a/klipper/klipper.kcfg
++++ b/klipper/klipper.kcfg
+@@ -14,6 +14,16 @@
+       <default>true</default>
+       <tooltip>Retain the clipboard history, so it will be available the next time you log in.</tooltip>
+     </entry>
++    <entry name="PasteOnSelect" type="Bool">
++      <label>Paste selected item automatically</label>
++      <default>false</default>
++      <tooltip>Automatically paste the selected item into the active application after choosing it from the clipboard history popup.</tooltip>
++    </entry>
++    <entry name="PasteKeySequence" type="String">
++      <label>Key combination to paste automatically</label>
++      <default>Ctrl+V</default>
++      <tooltip>The keyboard shortcut sent to the active window when pasting automatically.</tooltip>
++    </entry>
+     <entry name="PreventEmptyClipboard" key="NoEmptyClipboard" type="Bool">
+       <label>Prevent the clipboard from being cleared</label>
+       <default>true</default>
+diff --git a/klipper/klippersettings.kcfgc b/klipper/klippersettings.kcfgc
+index 5805df8..f9ae20a 100644
+--- a/klipper/klippersettings.kcfgc
++++ b/klipper/klippersettings.kcfgc
+@@ -1,6 +1,8 @@
+ # Code generation options for kconfig_compiler
+ File=klipper.kcfg
+ ClassName=KlipperSettings
++Visibility=KLIPPER_EXPORT
++IncludeFiles=klipper_export.h
+ Singleton=true
+ CustomAdditions=false
+ SetUserTexts=true
+diff --git a/klipper/org.kde.klipper.desktop b/klipper/org.kde.klipper.desktop
+index d7c52dc..d51780d 100644
+--- a/klipper/org.kde.klipper.desktop
++++ b/klipper/org.kde.klipper.desktop
+@@ -180,6 +180,7 @@ GenericName[zh_TW]=剪貼簿工具
+ Exec=/usr/bin/false
+ Icon=klipper
+ Type=Application
++X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input
+ X-DocPath=klipper/index.html
+ Terminal=false
+ # Tell AppStream generators not to merge info in this file so Discover and other
+diff --git a/klipper/synthetickeyboard.cpp b/klipper/synthetickeyboard.cpp
+new file mode 100644
+index 0000000..aca61e0
+--- /dev/null
++++ b/klipper/synthetickeyboard.cpp
+@@ -0,0 +1,191 @@
++/*
++    SPDX-FileCopyrightText: 2026 Nuri <nuri@example.com>
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "synthetickeyboard.h"
++#include "keymapper.h"
++#include "klipper_debug.h"
++
++#include <QGuiApplication>
++#include <QKeyCombination>
++#include <KWindowSystem>
++
++#if __has_include(<QtWaylandClient/QWaylandClientExtension>)
++#include <QtWaylandClient/QWaylandClientExtension>
++#include "qwayland-fake-input.h"
++#define HAVE_WAYLAND_CLIENT 1
++#endif
++
++#ifdef HAVE_X11_XTEST
++#include <xcb/xcb.h>
++#include <xcb/xtest.h>
++#include <X11/Xlib.h>
++#endif
++
++#if HAVE_WAYLAND_CLIENT
++class FakeInputDevice : public QWaylandClientExtensionTemplate<FakeInputDevice, &QtWayland::org_kde_kwin_fake_input::destroy>,
++                        public QtWayland::org_kde_kwin_fake_input
++{
++    Q_OBJECT
++public:
++    explicit FakeInputDevice(QObject *parent = nullptr)
++        : QWaylandClientExtensionTemplate<FakeInputDevice, &QtWayland::org_kde_kwin_fake_input::destroy>(6, parent)
++    {
++        connect(this, &QWaylandClientExtension::activeChanged, this, [this]() {
++            tryAuthenticate();
++        });
++        initialize();
++        tryAuthenticate();
++    }
++
++private:
++    void tryAuthenticate()
++    {
++        if (isActive() && !m_authenticated) {
++            m_authenticated = true;
++            qCDebug(KLIPPER_LOG) << "FakeInputDevice active, authenticating...";
++            authenticate(QStringLiteral("klipper"), QStringLiteral("Paste on select"));
++        }
++    }
++
++    bool m_authenticated = false;
++};
++#endif
++
++class SyntheticKeyboard::Private
++{
++public:
++#if HAVE_WAYLAND_CLIENT
++    std::unique_ptr<FakeInputDevice> fakeInput;
++#endif
++};
++
++SyntheticKeyboard *SyntheticKeyboard::self()
++{
++    static SyntheticKeyboard instance;
++    return &instance;
++}
++
++SyntheticKeyboard::SyntheticKeyboard(QObject *parent)
++    : QObject(parent)
++    , d(std::make_unique<Private>())
++{
++#if HAVE_WAYLAND_CLIENT
++    if (KWindowSystem::isPlatformWayland()) {
++        d->fakeInput = std::make_unique<FakeInputDevice>(this);
++    }
++#endif
++
++    if (qApp) {
++        connect(qApp, &QCoreApplication::aboutToQuit, this, [this]() {
++#if HAVE_WAYLAND_CLIENT
++            d->fakeInput.reset();
++#endif
++        });
++    }
++}
++
++SyntheticKeyboard::~SyntheticKeyboard()
++{
++#if HAVE_WAYLAND_CLIENT
++    d->fakeInput.reset();
++#endif
++}
++
++void SyntheticKeyboard::sendKeySequence(const QKeySequence &seq)
++{
++    if (seq.isEmpty() || seq.count() == 0) {
++        qCDebug(KLIPPER_LOG) << "Empty key sequence provided to SyntheticKeyboard";
++        return;
++    }
++
++    if (KWindowSystem::isPlatformWayland()) {
++#if HAVE_WAYLAND_CLIENT
++        if (!d->fakeInput || !d->fakeInput->isActive()) {
++            qCWarning(KLIPPER_LOG) << "Wayland fake_input interface is not available or not active";
++            return;
++        }
++
++        QList<quint32> modifiers;
++        quint32 key = 0;
++        if (!KeyMapper::decomposeKeySequence(seq, modifiers, key)) {
++            qCWarning(KLIPPER_LOG) << "Failed to decompose key sequence for Wayland input" << seq;
++            return;
++        }
++
++        // 1. Press all modifiers
++        for (quint32 mod : modifiers) {
++            d->fakeInput->keyboard_key(mod, 1);
++        }
++
++        // 2. Press and release the primary key
++        d->fakeInput->keyboard_key(key, 1);
++        d->fakeInput->keyboard_key(key, 0);
++
++        // 3. Release all modifiers in reverse order (guaranteed)
++        for (auto it = modifiers.crbegin(); it != modifiers.crend(); ++it) {
++            d->fakeInput->keyboard_key(*it, 0);
++        }
++#else
++        qCWarning(KLIPPER_LOG) << "Compiled without Wayland client fake-input support";
++#endif
++        return;
++    }
++
++#if HAVE_X11_XTEST
++    if (KWindowSystem::isPlatformX11()) {
++        auto *x11App = qGuiApp->nativeInterface<QNativeInterface::QX11Application>();
++        if (!x11App) {
++            return;
++        }
++        xcb_connection_t *conn = x11App->connection();
++        Display *display = x11App->display();
++        if (!conn || !display) {
++            return;
++        }
++
++        const QKeyCombination comb = seq[0];
++        const Qt::Key key = comb.key();
++        const quint32 keySym = KeyMapper::toX11KeySym(key);
++        if (keySym == 0) {
++            qCWarning(KLIPPER_LOG) << "Could not map key to X11 keysym" << key;
++            return;
++        }
++
++        const xcb_keycode_t keyCode = XKeysymToKeycode(display, keySym);
++        if (keyCode == 0) {
++            qCWarning(KLIPPER_LOG) << "Could not resolve X11 keycode for keysym" << keySym;
++            return;
++        }
++
++        const QList<quint32> modSyms = KeyMapper::modifiersToX11KeySyms(comb.keyboardModifiers());
++        QList<xcb_keycode_t> modCodes;
++        modCodes.reserve(modSyms.size());
++        for (quint32 sym : modSyms) {
++            if (xcb_keycode_t mc = XKeysymToKeycode(display, sym)) {
++                modCodes.append(mc);
++            }
++        }
++
++        // 1. Press modifiers
++        for (xcb_keycode_t mc : modCodes) {
++            xcb_test_fake_input(conn, XCB_KEY_PRESS, mc, XCB_CURRENT_TIME, XCB_WINDOW_NONE, 0, 0, 0);
++        }
++
++        // 2. Press and release key
++        xcb_test_fake_input(conn, XCB_KEY_PRESS, keyCode, XCB_CURRENT_TIME, XCB_WINDOW_NONE, 0, 0, 0);
++        xcb_test_fake_input(conn, XCB_KEY_RELEASE, keyCode, XCB_CURRENT_TIME, XCB_WINDOW_NONE, 0, 0, 0);
++
++        // 3. Release modifiers in reverse order
++        for (auto it = modCodes.crbegin(); it != modCodes.crend(); ++it) {
++            xcb_test_fake_input(conn, XCB_KEY_RELEASE, *it, XCB_CURRENT_TIME, XCB_WINDOW_NONE, 0, 0, 0);
++        }
++
++        xcb_flush(conn);
++        return;
++    }
++#endif
++}
++
++#include "synthetickeyboard.moc"
+diff --git a/klipper/synthetickeyboard.h b/klipper/synthetickeyboard.h
+new file mode 100644
+index 0000000..23a5402
+--- /dev/null
++++ b/klipper/synthetickeyboard.h
+@@ -0,0 +1,31 @@
++/*
++    SPDX-FileCopyrightText: 2026 Nuri <nuri@example.com>
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#ifndef SYNTHETICKEYBOARD_H
++#define SYNTHETICKEYBOARD_H
++
++#include <QKeySequence>
++#include <QObject>
++#include <memory>
++#include "klipper_export.h"
++
++class KLIPPER_EXPORT SyntheticKeyboard : public QObject
++{
++    Q_OBJECT
++
++public:
++    static SyntheticKeyboard *self();
++    ~SyntheticKeyboard() override;
++
++    void sendKeySequence(const QKeySequence &seq);
++
++private:
++    explicit SyntheticKeyboard(QObject *parent = nullptr);
++
++    class Private;
++    std::unique_ptr<Private> d;
++};
++
++#endif // SYNTHETICKEYBOARD_H
+diff --git a/shell/org.kde.plasmashell.desktop.cmake b/shell/org.kde.plasmashell.desktop.cmake
+index e9aa2c6..12c7961 100644
+--- a/shell/org.kde.plasmashell.desktop.cmake
++++ b/shell/org.kde.plasmashell.desktop.cmake
+@@ -51,5 +51,5 @@ Icon=plasma-symbolic
+ NoDisplay=true
+ X-systemd-skip=true
+ 
+-X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,org_kde_kwin_keystate,zkde_screencast_unstable_v1,org_kde_plasma_activation_feedback,kde_lockscreen_overlay_v1
++X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,org_kde_kwin_keystate,zkde_screencast_unstable_v1,org_kde_plasma_activation_feedback,kde_lockscreen_overlay_v1,org_kde_kwin_fake_input
+ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
